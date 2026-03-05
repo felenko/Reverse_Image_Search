@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en" class="gallery-page">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Minimum Web – Site 2 (Dark Gallery)</title>
+    <link rel="stylesheet" href="../styles.css" />
+  </head>
+  <body class="gallery-dark">
+    <header class="site-header gallery-header">
+      <div class="container">
+        <div class="breadcrumb">
+          <a href="../index.html">← Back to Minimum Web</a>
+        </div>
+        <h1>Site 2 – Dark Portrait Gallery</h1>
+        <p class="gallery-subtitle">
+          A moodier, dark-themed gallery of 100 portraits.
+        </p>
+      </div>
+    </header>
+
+    <div class="toolbar">
+      <div class="pill">
+        <span>100</span> portraits · men &amp; women
+      </div>
+      <div>Style: dark background, glowing cards</div>
+    </div>
+
+    <main class="gallery-grid"></main>
+
+    <script src="../portraits.js"></script>
+    <script>
+      generatePortraits({
+        containerSelector: ".gallery-grid",
+        count: 100,
+        siteLabel: "Site 2",
+      });
+    </script>
+  </body>
+</html>
+

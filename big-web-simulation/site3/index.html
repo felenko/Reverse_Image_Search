@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en" class="gallery-page">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Minimum Web – Site 3 (Colorful Cards)</title>
+    <link rel="stylesheet" href="../styles.css" />
+  </head>
+  <body class="gallery-colorful">
+    <header class="site-header gallery-header">
+      <div class="container">
+        <div class="breadcrumb">
+          <a href="../index.html">← Back to Minimum Web</a>
+        </div>
+        <h1>Site 3 – Colorful Portrait Cards</h1>
+        <p class="gallery-subtitle">
+          100 portraits with colorful card borders and a soft gradient
+          background.
+        </p>
+      </div>
+    </header>
+
+    <div class="toolbar">
+      <div class="pill">
+        <span>100</span> portraits · mixed genders
+      </div>
+      <div>Theme: colorful accents and soft gradients</div>
+    </div>
+
+    <main class="gallery-grid"></main>
+
+    <script src="../portraits.js"></script>
+    <script>
+      generatePortraits({
+        containerSelector: ".gallery-grid",
+        count: 100,
+        siteLabel: "Site 3",
+      });
+    </script>
+  </body>
+</html>
+

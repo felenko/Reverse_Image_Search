@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en" class="gallery-page">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Minimum Web – Site 1 (Classic Grid)</title>
+    <link rel="stylesheet" href="../styles.css" />
+  </head>
+  <body>
+    <header class="site-header gallery-header">
+      <div class="container">
+        <div class="breadcrumb">
+          <a href="../index.html">← Back to Minimum Web</a>
+        </div>
+        <h1>Site 1 – Classic Portrait Grid</h1>
+        <p class="gallery-subtitle">
+          Simple, bright gallery with 100 portrait cards (men and women).
+        </p>
+      </div>
+    </header>
+
+    <div class="toolbar">
+      <div class="pill">
+        <span>100</span> portraits · alternating men and women
+      </div>
+      <div>Layout: classic responsive grid</div>
+    </div>
+
+    <main class="gallery-grid"></main>
+
+    <script src="../portraits.js"></script>
+    <script>
+      generatePortraits({
+        containerSelector: ".gallery-grid",
+        count: 100,
+        siteLabel: "Site 1",
+      });
+    </script>
+  </body>
+</html>
+
