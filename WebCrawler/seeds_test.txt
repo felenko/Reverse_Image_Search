@@ -1,0 +1,9 @@
+# Big-web-simulation test seeds
+# Serve the simulation first:
+#   cd C:\Source\Reverse_Image_Search\big-web-simulation
+#   python -m http.server 8080
+#
+# Then run the crawler:
+#   python crawler.py seeds_test.txt --output crawled_faces --verbose
+
+http://localhost:3000/

@@ -1,0 +1,11 @@
+Step 1 — serve the simulation in one terminal:                                                                                                                                                                                   cd C:\Source\Reverse_Image_Search\big-web-simulation                                                                                                                                                                           
+  python -m http.server 8080                                                                                                                                                                                                                                                                                                                                                                                                                                      
+Step 2 — run the crawler in another terminal:                                                                                                                                                                                    cd C:\Source\Reverse_Image_Search\WebCrawler                                                                                                                                                                                   
+  .venv\Scripts\activate
+  python crawler.py seeds_test.txt --output crawled_faces --verbose
+
+  Key flags:
+  - --verbose — shows every image URL and face detection result
+  - --max-pages N — limits crawl depth (useful for quick tests)
+  - --wait 2000 — ms to wait after page load for JS to finish rendering (increase if images aren't appearing)
+  - --delay 0.5 — polite delay between page loads
