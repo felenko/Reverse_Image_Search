@@ -1,0 +1,437 @@
+SCALABILITY THOUGHTS — Reverse Image Search (Face Recognition at Web Scale)
+===========================================================================
+Goal: scrape the whole web for portrait photos, detect faces, embed them with
+AdaFace, and make them searchable. Two fleets must scale independently:
+  1. WebCrawler fleet  — discovers and downloads images from the web
+  2. FRWorker fleet    — detects faces and computes AdaFace embeddings
+
+
+═══════════════════════════════════════════════════════════════════════════════
+1. THE PIPELINE (current vs. target)
+═══════════════════════════════════════════════════════════════════════════════
+
+Current (single-machine):
+  Browser/seed list → crawler.py → images on disk → worker.py → LanceDB (local dir)
+
+Target (distributed):
+  Seed list
+      │
+      ▼
+  URL Frontier (distributed queue)
+      │
+      ├── Crawler-1  ─┐
+      ├── Crawler-2  ─┼──► Image Queue (Kafka/Redis Streams)
+      └── Crawler-N  ─┘
+                          │
+                          ├── FRWorker-1  ─┐
+                          ├── FRWorker-2  ─┼──► Vector DB (distributed)
+                          └── FRWorker-M  ─┘
+                                               │
+                                               └──► app.py (query service)
+
+
+═══════════════════════════════════════════════════════════════════════════════
+2. WEBCRAWLER FLEET
+═══════════════════════════════════════════════════════════════════════════════
+
+2a. URL Frontier (distributed work queue)
+------------------------------------------
+- Replace the in-process queue (deque) with a shared external queue.
+- Candidates: Redis (LPUSH/BRPOP), Kafka topics, AWS SQS.
+- Redis is the simplest starting point; Kafka is better for replay / audit.
+- Each crawler instance pulls URLs from the frontier, processes the page,
+  and pushes newly discovered URLs back into the frontier.
+- Priority queuing: score URLs by domain freshness, link depth, or
+  estimated portrait density (pages known to have photos score higher).
+
+2b. Inter-instance URL deduplication
+--------------------------------------
+- Problem: N crawlers will independently discover the same URLs.
+- Option A — Redis SET: `SADD seen_urls <url>` before enqueuing. Simple,
+  exact, but RAM-hungry at billion-URL scale (~50 bytes per URL).
+- Option B — Bloom filter: probabilistic, ~10 bits/URL, near-zero false
+  negatives acceptable (we'd just skip a URL we already crawled).
+  RedisBloom module or a shared in-memory filter (e.g. pybloom-live).
+- Option C — URL fingerprint in Redis: SHA-1 the URL, store only 8 bytes.
+  Compact exact dedup; ~8 GB per billion URLs.
+- Recommendation: RedisBloom for URL frontier dedup at large scale.
+
+2c. Image content deduplication
+---------------------------------
+- Many pages embed the same CDN image. Running AdaFace on duplicates wastes GPU.
+- Before enqueuing an image for FR processing, compute a perceptual hash
+  (pHash / dHash) of the downloaded image.
+- Store pHash in Redis SET. If already seen, discard — do not send to FRWorker.
+- pHash is robust to minor JPEG re-encoding, resize, watermarks.
+- MD5/SHA-1 of raw bytes catches exact duplicates (cheaper, complementary).
+
+2d. Politeness / rate limiting
+--------------------------------
+- Crawlers must obey robots.txt and per-domain crawl delays.
+- Track "last fetch time per domain" in Redis. Each crawler checks before
+  fetching; backs off if domain was touched within the crawl delay window.
+- Distribute domains across crawlers (consistent hash on domain name) so only
+  one crawler is responsible for a given domain at a time — avoids hammering
+  the same site from multiple instances simultaneously.
+
+2e. Crawler checkpointing / fault tolerance
+---------------------------------------------
+- If a crawler crashes mid-page, the URL should return to the frontier.
+- Use queue visibility timeouts (SQS) or Redis key TTL + worker heartbeat:
+  worker sets a TTL lock on the URL; if it expires without an ACK the URL
+  is re-enqueued.
+- Checkpoint crawl state (visited set, frontier) periodically to durable
+  storage (S3 or disk snapshot) so a full fleet restart does not re-crawl
+  everything from scratch.
+
+2f. Crawler instance design
+-----------------------------
+- Each instance: one Playwright browser process + N async page workers
+  (asyncio + Playwright async API allows ~10-20 concurrent page fetches
+  per process without spawning N full browser instances).
+- Image downloads: separate async HTTP pool (httpx), not through the browser.
+- Container size: ~1 CPU, ~2 GB RAM per crawler instance.
+- Face pre-filter in crawler: run a fast lightweight face detector
+  (e.g. OpenCV Haar or yunet) BEFORE sending to FRWorker queue.
+  This eliminates landscape/product/diagram images early, reducing FRWorker load.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+3. FRWORKER FLEET
+═══════════════════════════════════════════════════════════════════════════════
+
+3a. Work distribution
+----------------------
+- FRWorkers pull image jobs from the Image Queue (Kafka or Redis Streams).
+- Job message contains: image URL or object-store key, source page URL,
+  crawl timestamp, pHash.
+- Workers are stateless — any worker can process any job.
+- Scale out by adding worker instances; scale in when queue depth drops.
+
+3b. Model loading strategy
+----------------------------
+- Current: each worker loads AdaFace IR-50 into RAM on startup (~170 MB weights).
+- At fleet scale this is fine — load once per worker process, keep in memory,
+  process a continuous stream of images.
+- Alternatively: a dedicated model-serving sidecar (TorchServe or Triton
+  Inference Server) shared by several worker threads. Reduces GPU memory if
+  multiple workers run on the same GPU host.
+- GPU workers: one GPU can batch ~64 faces at ~15ms per batch → ~4000 faces/sec.
+  AdaFace is the expensive step; face detection (OpenCV) is CPU-only and cheap.
+  Pipeline: CPU thread detects+crops faces → GPU thread batches embeddings.
+
+3c. Batching
+-------------
+- Current code processes one image at a time (batch size = 1).
+- For GPU efficiency: accumulate N face crops, run a single forward pass.
+  Batch size 32-64 is typically optimal for IR-50 on a modern GPU.
+- Implement a micro-batcher: worker reads from queue into a local buffer,
+  flushes when buffer reaches batch_size OR a timeout expires (e.g. 50ms),
+  whichever comes first.
+
+3d. Image deduplication at worker level
+-----------------------------------------
+- Worker should re-check pHash against the "already processed" set before
+  running inference (the crawler-side check may race).
+- After inserting into vector DB, record the pHash as processed.
+
+3e. Handling detection failures
+---------------------------------
+- "No face detected" is a normal outcome (~30-60% of portrait-tagged images
+  may still not yield a detectable face with Haar cascade).
+- Consider a second-pass with a more sensitive detector (e.g. RetinaFace,
+  MTCNN, or OpenCV DNN face detector) for images where Haar fails.
+- Dead-letter queue: images that consistently fail (corrupt, unsupported format)
+  go to a separate DLQ for investigation, not re-queued indefinitely.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+4. VECTOR DATABASE (replacing local LanceDB)
+═══════════════════════════════════════════════════════════════════════════════
+
+Current: LanceDB in a local directory — not suitable for a fleet.
+
+Options:
+
+A. LanceDB on object storage (S3 / GCS)
+   - LanceDB natively supports S3-compatible storage as the backend.
+   - Multiple writers are safe (append-only format with object-store atomics).
+   - No extra infrastructure — just point --db at s3://bucket/face_db.
+   - Reads (search) require fetching index files from S3 — adds ~50-200ms
+     latency per query unless index is cached locally.
+   - Good for: moderate query rate, lowest ops overhead.
+
+B. Qdrant (self-hosted or cloud)
+   - Distributed, production-grade vector DB with horizontal sharding.
+   - Native gRPC API, filtering on metadata, on-disk indexing (HNSW).
+   - Can handle hundreds of millions of vectors across a cluster.
+   - Best fit for this use case at scale.
+
+C. Milvus
+   - Similar to Qdrant; heavier operational footprint (depends on etcd, MinIO).
+   - Better if you're already in a Kubernetes environment with those services.
+
+D. Pinecone / Weaviate Cloud
+   - Managed SaaS — zero ops, scales automatically.
+   - Cost at billions of vectors becomes significant.
+
+Recommendation: start with LanceDB on S3 (easiest migration from current
+code — just change the db path). Graduate to Qdrant when query latency or
+concurrent write throughput becomes a bottleneck.
+
+Embedding deduplication in vector DB:
+- Before inserting a new embedding, check if a near-identical vector already
+  exists (cosine similarity > 0.999). If so, merge the record (add the new
+  source URL) rather than inserting a duplicate vector. This keeps the DB
+  from bloating with the same face from different crawl sources.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+5. COORDINATION & MESSAGING — KAFKA
+═══════════════════════════════════════════════════════════════════════════════
+
+Why Kafka over alternatives:
+- Redis Streams: simplest to operate; consumer groups + replay. Good to ~10k
+  msg/sec but RAM-bound and not designed as a durable log.
+- AWS SQS: managed, auto-scales, at-least-once delivery. No replay — if
+  FRWorkers crash mid-batch you cannot rewind and reprocess.
+- Kafka: partitioned, replicated durable log. Millions of msg/sec. Replay by
+  resetting consumer group offsets — critical when re-indexing with a new
+  model version. Overhead: 3-node KRaft broker cluster (~6 GB RAM total).
+  Worth it at fleet scale; use Redis Streams for Phase 2.
+
+Topic layout:
+  raw_urls            — discovered page URLs (crawlers produce, crawlers consume)
+                        partitioned by domain hash → only one crawler per domain
+  image_jobs          — image URLs/S3 keys ready for FR (crawlers → FRWorkers)
+                        partitioned by image URL hash for even load distribution
+  embedding_results   — completed (pHash, embedding, source_url, timestamp)
+                        FRWorkers → DB writer service
+  dead_letters        — jobs that failed 3× retries, for manual inspection
+
+Retention policy:
+  raw_urls / image_jobs  → 7 days (enough for reprocessing a week of crawl)
+  embedding_results      → 30 days (allows DB rebuild from Kafka alone)
+  dead_letters           → 90 days
+
+Message schema (image_jobs, JSON or Avro):
+  {
+    "image_url":    "https://example.com/photo.jpg",
+    "storage_key":  "s3://bucket/raw/2024/01/01/abc123.jpg",
+    "source_page":  "https://example.com/people",
+    "phash":        "f8a3c9...",
+    "crawled_at":   "2024-01-01T12:00:00Z",
+    "crawler_id":   "crawler-03"
+  }
+
+Consumer group strategy:
+  - "frworkers" consumer group reads image_jobs; each partition is owned by
+    one FRWorker at a time. Kafka rebalances automatically when workers
+    join or leave the fleet.
+  - Commit offset only AFTER embedding is confirmed written to vector DB,
+    not when the message is received. This gives at-least-once processing
+    guarantees — safe because of pHash deduplication on insert.
+
+Re-indexing with a new model version:
+  - Deploy new FRWorkers with a new consumer group name (e.g. "frworkers-v2").
+  - Reset offset to beginning of embedding_results or image_jobs retention window.
+  - New workers rebuild the DB in parallel with the live fleet — swap the
+    query service to the new DB once re-indexing completes.
+
+A dedicated DB writer service (single or small pool) reads embedding_results
+and inserts into the vector DB. This serializes writes, avoids vector DB
+hotspots, and lets you swap the DB backend without touching FRWorkers.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+6. MONITORING
+═══════════════════════════════════════════════════════════════════════════════
+
+Stack: Prometheus (metrics scraping) + Grafana (dashboards + alerting)
+       Loki (log aggregation) + Promtail (log shipping from each container)
+All three run as containers alongside the fleet; Grafana datasources: both
+Prometheus and Loki so you can correlate metrics with log lines.
+
+6a. Metrics to expose (Prometheus)
+------------------------------------
+Each component exposes a /metrics endpoint (prometheus_client for Python).
+
+CRAWLERS
+  crawler_pages_fetched_total{crawler_id}          — pages downloaded
+  crawler_pages_failed_total{crawler_id, reason}   — fetch errors (timeout, 4xx, 5xx)
+  crawler_images_found_total{crawler_id}            — img tags discovered
+  crawler_images_enqueued_total{crawler_id}         — passed pHash dedup, sent to queue
+  crawler_images_deduped_total{crawler_id}          — dropped by pHash dedup
+  crawler_queue_depth                              — current frontier queue depth
+                                                     (scraped from Kafka lag)
+  crawler_fetch_duration_seconds{quantile}          — page fetch latency histogram
+
+FRWORKERS
+  frworker_images_processed_total{worker_id}       — images pulled from queue
+  frworker_faces_detected_total{worker_id}         — faces found by detector
+  frworker_faces_no_detection_total{worker_id}     — images with no face
+  frworker_embeddings_inserted_total{worker_id}    — vectors written to DB
+  frworker_inference_duration_seconds{quantile}    — AdaFace forward pass latency
+  frworker_batch_size{quantile}                    — actual batch sizes (GPU util proxy)
+  frworker_queue_lag                               — Kafka consumer group lag
+                                                     (how far behind live crawl)
+  frworker_gpu_utilization_percent{worker_id}      — via nvidia-smi or dcgm-exporter
+
+VECTOR DB (Qdrant built-in metrics or custom)
+  vectordb_total_vectors                           — total embeddings indexed
+  vectordb_insert_duration_seconds{quantile}
+  vectordb_search_duration_seconds{quantile}
+
+APP (query service)
+  app_search_requests_total{status}               — 200 / 400 / 500
+  app_search_duration_seconds{quantile}           — end-to-end query latency
+  app_no_match_total                              — queries returning 0 results
+  app_matches_above_threshold_total
+
+KAFKA (JMX exporter or kafka-exporter)
+  kafka_topic_partition_offset{topic, partition}  — current end offset
+  kafka_consumergroup_lag{group, topic, partition} — lag per consumer group
+  kafka_messages_in_per_sec{topic}
+
+6b. Key dashboards (Grafana)
+------------------------------
+Dashboard 1 — Fleet Overview
+  - Total pages crawled / day (rate over 24h)
+  - Total faces indexed (cumulative, from vectordb_total_vectors)
+  - Images/min entering the FR queue vs. embeddings/min leaving it
+    (gap = processing backlog growing or shrinking)
+  - Kafka lag for "frworkers" consumer group (should stay near zero)
+
+Dashboard 2 — Crawler Health
+  - Pages/min per crawler instance (stacked bar)
+  - Error rate by reason (timeout vs. HTTP 4xx vs. HTTP 5xx)
+  - Dedup hit rate (images_deduped / images_found) — high rate = good
+  - Frontier queue depth over time (should stay bounded)
+  - P99 fetch latency
+
+Dashboard 3 — FRWorker / GPU
+  - Embeddings/min per worker (stacked)
+  - Face detection rate (faces_detected / images_processed)
+    — sudden drop may indicate detector regression or image format issue
+  - GPU utilization % per host (from dcgm-exporter)
+  - Batch size distribution (P50/P99) — low P50 = GPU underutilized,
+    increase micro-batcher timeout
+  - Kafka consumer lag trend
+
+Dashboard 4 — Query Service (app.py)
+  - Request rate (req/sec)
+  - P50 / P95 / P99 search latency
+  - Error rate (5xx)
+  - No-match rate (0 results returned) — useful for tuning MIN_SIMILARITY
+
+6c. Alerts (Grafana alerting or Alertmanager)
+----------------------------------------------
+  CRITICAL
+    kafka_consumergroup_lag > 500k for > 15 min
+      → FRWorkers can't keep up; scale up GPU workers
+    frworker_queue_lag = 0 but frworker_images_processed_total flat
+      → FRWorkers are stuck / crashed
+    vectordb_insert_duration_seconds p99 > 5s
+      → Vector DB under pressure
+    app_search_duration_seconds p99 > 2s
+      → Query service degraded
+
+  WARNING
+    crawler_pages_failed_total rate > 20% over 5 min
+      → Network issue or mass blocking by target sites
+    frworker_faces_no_detection_total / frworker_images_processed_total > 80%
+      → Detector may be broken, or crawlers are sending non-portrait images
+    frworker_gpu_utilization_percent < 30% for > 10 min
+      → Batching pipeline stalled; check image queue or micro-batcher config
+    crawler_queue_depth = 0
+      → Frontier exhausted; need new seeds or recrawl cycle
+
+6d. Logging (Loki + Promtail)
+------------------------------
+- All components log structured JSON to stdout.
+- Promtail (sidecar or DaemonSet) ships logs to Loki.
+- Key log fields: component, instance_id, level, event, url, phash,
+  duration_ms, error.
+- Loki labels: {job="crawler"}, {job="frworker"}, {job="app"}, {level="error"}
+- Grafana Explore: correlate a Grafana alert spike with the actual log lines
+  from that time window without leaving the UI.
+- Retention: 30 days for INFO, 90 days for ERROR/WARN.
+
+6e. Distributed tracing (optional, Phase 4)
+---------------------------------------------
+- Add a trace_id to every Kafka message at the crawler (when image is first seen).
+- Propagate through FRWorker and DB writer.
+- Ship spans to Tempo (Grafana's tracing backend).
+- Lets you follow one image URL end-to-end: crawl → queue → inference → DB insert
+  and measure latency at each hop.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+7. INFRASTRUCTURE / DEPLOYMENT
+═══════════════════════════════════════════════════════════════════════════════
+
+- Containerize: one Dockerfile per component (crawler, frworker, app, db-writer).
+- Orchestration: Kubernetes.
+  - Crawler deployment: CPU nodes, HPA on Kafka raw_urls lag.
+  - FRWorker deployment: GPU nodes (NVIDIA), HPA on image_jobs consumer lag.
+  - App deployment: small CPU pods behind an ingress load balancer.
+  - Monitoring stack: Prometheus, Grafana, Loki, Promtail as a Helm chart
+    (kube-prometheus-stack + Loki stack).
+- Object storage (S3 / MinIO): raw image archive + LanceDB/Qdrant snapshots.
+- GPU nodes: NVIDIA device plugin for Kubernetes; request "nvidia.com/gpu: 1"
+  in FRWorker pod spec. Use dcgm-exporter DaemonSet for GPU metrics.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+8. ROUGH CAPACITY ESTIMATES
+═══════════════════════════════════════════════════════════════════════════════
+
+Assumptions:
+- Average web page: ~20 images, ~3 are portraits with detectable faces.
+- AdaFace IR-50 on GPU: ~4000 faces/sec per GPU (batch mode).
+- Target: index 1 billion faces.
+
+Crawler fleet:
+- 1 crawler instance: ~100 pages/min = ~300 face-candidate images/min.
+- To crawl 100M pages/day: ~700 crawler instances running continuously.
+
+FRWorker fleet:
+- 300 face images/min per crawler × 700 crawlers = 210,000 images/min fleet-wide.
+- ~3500 images/sec needing FR processing.
+- At ~100 images/sec per GPU worker (including detection overhead): ~35 GPU workers.
+- With 4× A100 GPUs per host: ~9 GPU hosts.
+
+Vector DB:
+- 1 billion 512-dim float32 vectors = 512 × 4 bytes × 1B = ~2 TB raw vectors.
+- With HNSW index overhead: ~3-4 TB total. Fits on a small Qdrant cluster
+  (e.g. 3 × nodes with 2 TB NVMe each).
+
+These are ballpark numbers — real throughput depends heavily on network speed,
+target site response times, and face detection hit rate.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+9. PHASED ROLLOUT
+═══════════════════════════════════════════════════════════════════════════════
+
+Phase 1 — Single machine, current architecture (done)
+  - Local LanceDB, one crawler, one FRWorker process.
+
+Phase 2 — Shared queue, multiple workers on one machine
+  - Add Redis. FRWorker reads from Redis Stream instead of scanning a folder.
+  - Crawler pushes image paths/URLs to Redis Stream instead of saving locally.
+  - Multiple FRWorker processes on same machine share the GPU.
+  - LanceDB stays local for now.
+
+Phase 3 — Multi-machine, shared storage
+  - Move LanceDB to S3 (or stand up Qdrant).
+  - Move Redis to a dedicated host (or managed Redis).
+  - Deploy crawler and FRWorker on separate machines.
+  - Add pHash deduplication.
+
+Phase 4 — Full fleet
+  - Kubernetes orchestration, Kafka, GPU auto-scaling, Qdrant cluster.
+  - Full monitoring stack: Prometheus + Grafana + Loki + Tempo.
+  - Alertmanager with PagerDuty/Slack notifications.
+  - Crawler politeness + domain-sharding.
+  - Distributed tracing (trace_id through entire pipeline).
