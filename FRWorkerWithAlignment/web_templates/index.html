@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Face lookup — alignment-aware</title>
+  <style>
+    :root {
+      --bg: #0f0f12; --surface: #1a1a20; --border: #2a2a32;
+      --text: #e8e8ec; --muted: #888; --accent: #6c8cff;
+      --accent-hover: #8aa4ff; --success: #5cb85c; --error: #d9534f;
+      --warn: #e6a817;
+    }
+    * { box-sizing: border-box; }
+    body { font-family: "Segoe UI", system-ui, sans-serif; background: var(--bg);
+           color: var(--text); margin: 0; min-height: 100vh; padding: 2rem; }
+    .container { max-width: 700px; margin: 0 auto; }
+    h1 { font-size: 1.5rem; font-weight: 600; margin-bottom: 0.25rem; }
+    .sub { color: var(--muted); font-size: 0.9rem; margin-bottom: 1.5rem; }
+    .card { background: var(--surface); border: 1px solid var(--border);
+            border-radius: 12px; padding: 1.25rem; margin-bottom: 1rem; }
+    .input-zone { border: 2px dashed var(--border); border-radius: 8px; padding: 2rem;
+                  text-align: center; cursor: pointer; transition: border-color .2s, background .2s; }
+    .input-zone:hover, .input-zone.dragover { border-color: var(--accent); background: rgba(108,140,255,.06); }
+    .input-zone input[type="file"] { display: none; }
+    .paste-hint { font-size: .85rem; color: var(--muted); margin-top: .75rem; }
+    .controls { display: flex; gap: .75rem; align-items: center; margin-top: 1rem; flex-wrap: wrap; }
+    .controls label { font-size: .85rem; color: var(--muted); }
+    .controls input[type="range"] { width: 120px; }
+    .controls span { font-size: .85rem; min-width: 2.5rem; }
+    .btn { background: var(--accent); color: #fff; border: none; padding: .6rem 1.2rem;
+           border-radius: 8px; font-size: .95rem; cursor: pointer; }
+    .btn:hover { background: var(--accent-hover); }
+    .btn:disabled { opacity: .6; cursor: not-allowed; }
+    .preview { margin-top: 1rem; }
+    .preview img { max-width: 160px; max-height: 160px; border-radius: 8px; border: 1px solid var(--border); }
+    .status { margin-top: 1rem; font-size: .9rem; }
+    .status.error { color: var(--error); } .status.success { color: var(--success); }
+
+    /* Query info bar */
+    .query-info { display: flex; gap: 1.25rem; flex-wrap: wrap;
+                  font-size: .82rem; color: var(--muted); margin-top: .75rem; }
+    .query-info span b { color: var(--text); }
+    .badge { display: inline-block; padding: .15rem .45rem; border-radius: 4px;
+             font-size: .75rem; font-weight: 600; }
+    .badge.sim5pt    { background: #1a3a1a; color: #5cb85c; }
+    .badge.affine5pt { background: #3a2e1a; color: #e6a817; }
+    .badge.frontal_pnp   { background: #3a1a2e; color: #b85c9c; }
+    .badge.frontal_3ddfa { background: #1a2e3a; color: #5cb8b8; }
+
+    /* Results */
+    .results h3 { font-size: 1rem; margin-bottom: .75rem; }
+    .match { display: flex; align-items: center; gap: 1rem; padding: .75rem;
+             background: var(--bg); border-radius: 8px; margin-bottom: .5rem;
+             border: 1px solid var(--border); }
+    .match img { width: 80px; height: 80px; object-fit: cover; border-radius: 6px;
+                 border: 1px solid var(--border); }
+    .match .info .name { font-weight: 500; font-size: .9rem; }
+    .match .info .meta { color: var(--muted); font-size: .8rem; margin-top: .25rem; line-height: 1.6; }
+    .sim-bar-wrap { flex: 1; }
+    .sim-label { font-size: .8rem; color: var(--muted); margin-bottom: .2rem; }
+    .sim-bar { height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
+    .sim-fill { height: 100%; border-radius: 3px; background: var(--accent); transition: width .4s; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Face lookup</h1>
+    <p class="sub">Upload or paste a face image — aligned with RetinaFace + ArcFace, yaw-aware.</p>
+
+    <div class="card">
+      <div class="input-zone" id="dropZone">
+        <label for="fileInput" style="cursor:pointer;">Choose file or drop image here</label>
+        <input type="file" id="fileInput" accept="image/*">
+        <p class="paste-hint">Or paste from clipboard (Ctrl+V).</p>
+      </div>
+      <div class="preview" id="preview"></div>
+      <div class="controls">
+        <button type="button" class="btn" id="searchBtn" disabled>Search</button>
+        <label>Results: <input type="range" id="kSlider" min="1" max="35" value="10">
+          <span id="kVal">10</span></label>
+        <label>Min similarity: <input type="range" id="simSlider" min="0" max="100" value="50">
+          <span id="simVal">0.50</span></label>
+      </div>
+      <div class="status" id="status"></div>
+      <div class="query-info" id="queryInfo" style="display:none;"></div>
+    </div>
+
+    <div class="card results" id="resultsCard" style="display: none;">
+      <h3 id="resultsTitle">Matches</h3>
+      <div id="results"></div>
+    </div>
+  </div>
+
+  <script>
+    const dropZone   = document.getElementById('dropZone');
+    const fileInput  = document.getElementById('fileInput');
+    const preview    = document.getElementById('preview');
+    const searchBtn  = document.getElementById('searchBtn');
+    const status     = document.getElementById('status');
+    const resultsCard= document.getElementById('resultsCard');
+    const resultsDiv = document.getElementById('results');
+    const queryInfo  = document.getElementById('queryInfo');
+    const kSlider    = document.getElementById('kSlider');
+    const kVal       = document.getElementById('kVal');
+    const simSlider  = document.getElementById('simSlider');
+    const simVal     = document.getElementById('simVal');
+
+    kSlider.addEventListener('input', () => kVal.textContent = kSlider.value);
+    simSlider.addEventListener('input', () => simVal.textContent = (simSlider.value/100).toFixed(2));
+
+    let currentDataUrl = null;
+
+    dropZone.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', e => { if (e.target.files[0]) setFile(e.target.files[0]); });
+    dropZone.addEventListener('dragover',  e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+    dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+    dropZone.addEventListener('drop', e => {
+      e.preventDefault(); dropZone.classList.remove('dragover');
+      const f = e.dataTransfer.files[0];
+      if (f && f.type.startsWith('image/')) setFile(f);
+    });
+    document.addEventListener('paste', e => {
+      const item = [].find.call(e.clipboardData?.items || [], x => x.type.startsWith('image/'));
+      if (item) { e.preventDefault(); setFile(item.getAsFile()); }
+    });
+
+    function setFile(file) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        currentDataUrl = reader.result;
+        preview.innerHTML = '<img src="' + currentDataUrl + '" alt="preview">';
+        searchBtn.disabled = false;
+        status.textContent = '';
+        queryInfo.style.display = 'none';
+        resultsCard.style.display = 'none';
+      };
+      reader.readAsDataURL(file);
+    }
+
+    function badge(method) {
+      const labels = { sim5pt:'sim 5pt', affine5pt:'affine 5pt',
+                       frontal_pnp:'frontal PnP', frontal_3ddfa:'frontal 3DDFA' };
+      return `<span class="badge ${method}">${labels[method] || method}</span>`;
+    }
+
+    searchBtn.addEventListener('click', async () => {
+      if (!currentDataUrl) return;
+      searchBtn.disabled = true;
+      status.textContent = 'Searching…';
+      status.className = 'status';
+      resultsDiv.innerHTML = '';
+      queryInfo.style.display = 'none';
+
+      const k       = kSlider.value;
+      const min_sim = (simSlider.value / 100).toFixed(2);
+
+      try {
+        const form = new FormData();
+        form.append('image', currentDataUrl);
+        const r    = await fetch(`/api/search?k=${k}&min_sim=${min_sim}`, { method: 'POST', body: form });
+        const data = await r.json();
+
+        if (!data.ok) {
+          status.textContent = data.error || 'Search failed';
+          status.className = 'status error';
+          searchBtn.disabled = false;
+          return;
+        }
+
+        // Query metadata bar
+        if (data.query) {
+          const q = data.query;
+          queryInfo.innerHTML =
+            `Query: ${badge(q.alignmentMethod)} &nbsp;` +
+            `<span>yaw <b>${q.yaw}°</b></span>` +
+            `<span>det score <b>${(q.detScore*100).toFixed(1)}%</b></span>` +
+            `<span>confidence <b>${(q.confidence*100).toFixed(1)}%</b></span>`;
+          queryInfo.style.display = 'flex';
+        }
+
+        const n = data.matches.length;
+        status.textContent = n ? `Found ${n} match${n>1?'es':''}.` : 'No matches above threshold.';
+        status.className = 'status ' + (n ? 'success' : '');
+        document.getElementById('resultsTitle').textContent = `Matches (${n})`;
+        resultsCard.style.display = n ? 'block' : 'none';
+
+        data.matches.forEach(m => {
+          const path   = (m.imageFileName||'').split('/').map(encodeURIComponent).join('/');
+          const imgUrl = path ? '/images/' + path : '';
+          const simPct = (m.similarity * 100).toFixed(1);
+          const confPct= (m.confidence * 100).toFixed(1);
+
+          const div = document.createElement('div');
+          div.className = 'match';
+          div.innerHTML = `
+            <img src="${imgUrl}" alt="match" onerror="this.style.opacity='.3'">
+            <div class="info" style="flex:1;">
+              <div class="name">${escapeHtml(m.imageFileName||'')}</div>
+              <div class="meta">
+                ${badge(m.alignmentMethod)}
+                &nbsp;conf <b>${confPct}%</b>
+              </div>
+              <div class="sim-bar-wrap" style="margin-top:.4rem;">
+                <div class="sim-label">Similarity: <b>${simPct}%</b></div>
+                <div class="sim-bar"><div class="sim-fill" style="width:${simPct}%"></div></div>
+              </div>
+            </div>`;
+          resultsDiv.appendChild(div);
+        });
+      } catch (err) {
+        status.textContent = 'Error: ' + err.message;
+        status.className = 'status error';
+      }
+      searchBtn.disabled = false;
+    });
+
+    function escapeHtml(s) {
+      const d = document.createElement('div'); d.textContent = s; return d.innerHTML;
+    }
+  </script>
+</body>
+</html>
