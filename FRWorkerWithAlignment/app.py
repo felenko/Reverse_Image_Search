@@ -20,7 +20,7 @@ from flask import Flask, jsonify, render_template, request, send_file
 from database import find_nearest, open_table
 from pipeline import FacePipeline
 
-app = Flask(__name__, template_folder="templates")
+app = Flask(__name__, template_folder="web_templates")
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 
 # Globals set by main()
@@ -47,7 +47,7 @@ def _get_image_bgr_from_request() -> np.ndarray | None:
         if f.filename:
             return _decode_image(f.read())
 
-    for src in (request.form, request.json or {}):
+    for src in (request.form, request.get_json(silent=True) or {}):
         if "image" in src:
             raw = src["image"].strip()
             if raw.startswith("data:image"):
@@ -85,7 +85,10 @@ def search():
 
         top_k          = request.args.get("k", 5, type=int)
         min_confidence = request.args.get("min_conf", 0.0, type=float)
-        min_similarity = request.args.get("min_sim", 0.92, type=float)
+        # Default 0.50 — enough to filter random non-matches while keeping
+        # cross-yaw same-person results (which score ~0.55–0.85 depending on angle).
+        # Raise to 0.85+ for high-precision / low-recall production use.
+        min_similarity = request.args.get("min_sim", 0.50, type=float)
 
         results_pipeline = PIPELINE.process_bgr(img_bgr, max_faces=1)
         if not results_pipeline:

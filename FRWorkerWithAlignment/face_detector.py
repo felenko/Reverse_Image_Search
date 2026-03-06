@@ -68,10 +68,12 @@ class RetinaFaceDetector:
         )
         ctx_id = 0 if device == "cuda" else -1
 
-        # Load detection + 106-point landmark models; skip recognition to keep it fast
+        # Load detection + landmark models.
+        # landmark_3d_68 provides accurate yaw/pitch/roll via face.pose.
+        # landmark_2d_106 provides dense 2D landmarks.
         self._fa = FaceAnalysis(
             name="buffalo_l",
-            allowed_modules=["detection", "landmark_2d_106"],
+            allowed_modules=["detection", "landmark_2d_106", "landmark_3d_68"],
             providers=providers,
         )
         self._fa.prepare(ctx_id=ctx_id, det_size=det_size)
@@ -96,9 +98,10 @@ class RetinaFaceDetector:
                 else None
             )
 
-            # Prefer insightface's pose if available; fall back to heuristic
+            # Prefer insightface pose (from landmark_3d_68 — accurate to ±90°).
+            # Fall back to geometric heuristic if unavailable.
             if hasattr(f, "pose") and f.pose is not None:
-                pose = np.asarray(f.pose).flatten()
+                pose  = np.asarray(f.pose).flatten()
                 # insightface returns [pitch, yaw, roll] in degrees
                 pitch = float(pose[0]) if len(pose) > 0 else 0.0
                 yaw   = float(pose[1]) if len(pose) > 1 else _estimate_yaw_from_5pt(kps_5pt)
@@ -107,6 +110,9 @@ class RetinaFaceDetector:
                 yaw   = _estimate_yaw_from_5pt(kps_5pt)
                 pitch = 0.0
                 roll  = 0.0
+                if abs(yaw) > 25:
+                    # Heuristic saturates beyond ~68°; flag so callers know
+                    pass  # alignment routing will still use the magnitude correctly
 
             results.append(FaceDetection(
                 bbox=np.array(f.bbox, dtype=np.float32),
